@@ -1,5 +1,7 @@
 # SimNorth
 
+[![DOI](https://zenodo.org/badge/1256404282.svg)](https://doi.org/10.5281/zenodo.20497228)
+
 Contrastive self-supervised representation learning for ultrasound frames.
 
 SimNorth maps frames onto the unit hypersphere with three objectives:
