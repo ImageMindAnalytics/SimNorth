@@ -17,6 +17,7 @@ Logs to MLflow. Example:
 """
 
 import argparse
+import json
 import os
 
 import torch
@@ -27,7 +28,7 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.loggers import MLFlowLogger
 
 import simnorth
-from simnorth import SimNorthImageLogger
+from simnorth import SimNorthImageLogger, BestMetricTracker
 
 
 def add_train_args(parser):
@@ -49,6 +50,7 @@ def add_train_args(parser):
     output_group.add_argument("--out", default="./", type=str, help="Checkpoint output dir")
     output_group.add_argument("--monitor", default="val_loss", type=str, help="Metric to monitor")
     output_group.add_argument("--monitor_mode", default="min", type=str, help="Monitor mode (min/max)")
+    output_group.add_argument("--write_metric", default=None, type=str, help="Write best monitored metric to this JSON file (for Optuna subprocess)")
 
     log_group = parser.add_argument_group("Logging")
     log_group.add_argument("--tracking_uri", default="file:./mlruns", type=str, help="MLflow tracking URI")
@@ -86,6 +88,7 @@ def main(args):
         monitor=args.monitor, min_delta=0.0, patience=args.patience, verbose=True, mode=args.monitor_mode
     )
     image_logger = SimNorthImageLogger(log_steps=args.image_log_steps)
+    best_tracker = BestMetricTracker(monitor=args.monitor, mode=args.monitor_mode)
 
     logger = MLFlowLogger(
         experiment_name=args.experiment_name,
@@ -99,7 +102,7 @@ def main(args):
         log_every_n_steps=args.log_steps,
         max_epochs=args.epochs,
         max_steps=args.steps,
-        callbacks=[early_stop_callback, checkpoint_callback, image_logger],
+        callbacks=[early_stop_callback, checkpoint_callback, image_logger, best_tracker],
         accelerator="gpu",
         devices=torch.cuda.device_count(),
         strategy=DDPStrategy(find_unused_parameters=args.find_unused_parameters)
@@ -110,6 +113,12 @@ def main(args):
     )
 
     trainer.fit(model, datamodule=datamodule, ckpt_path=args.model)
+
+    # Hand the best monitored metric back to the Optuna driver (rank 0 only).
+    # best_tracker reads the monitor in on_validation_end, after it is logged.
+    if args.write_metric and trainer.strategy.global_rank == 0:
+        with open(args.write_metric, "w") as f:
+            json.dump({best_tracker.monitor: best_tracker.best}, f)
 
 
 if __name__ == "__main__":

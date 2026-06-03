@@ -8,6 +8,7 @@ from .data.transforms import (
     SimTestTransforms,
 )
 from .callbacks.image_logger import SimNorthImageLogger
+from .callbacks.best_metric import BestMetricTracker
 
 __all__ = [
     "SimNorth",
@@ -23,4 +24,5 @@ __all__ = [
     "SimEvalTransforms",
     "SimTestTransforms",
     "SimNorthImageLogger",
+    "BestMetricTracker",
 ]
