@@ -10,10 +10,13 @@ import os
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
 import SimpleITK as sitk
 from torch.utils.data import Dataset, DataLoader
 from lightning.pytorch import LightningDataModule
+
+from .transforms import SimTrainTransforms, SimTrainTransformsV2, SimEvalTransforms
 
 
 class USDataset(Dataset):
@@ -51,62 +54,86 @@ class USDataset(Dataset):
 
 
 class USDataModule(LightningDataModule):
-    def __init__(
-        self,
-        df_train,
-        df_val,
-        df_test=None,
-        mount_point="./",
-        batch_size=256,
-        num_workers=4,
-        img_column="img_path",
-        train_transform=None,
-        valid_transform=None,
-        test_transform=None,
-        drop_last=True,
-        repeat_channel=True,
-        prefetch_factor=2,
-    ):
+    """Reads its dataframes and builds its transforms from the (flat) kwargs,
+    mirroring the FAMLI data modules. See :meth:`add_data_specific_args`.
+    """
+
+    def __init__(self, **kwargs):
         super().__init__()
-        self.df_train = df_train
-        self.df_val = df_val
-        self.df_test = df_test
-        self.mount_point = mount_point
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.img_column = img_column
-        self.train_transform = train_transform
-        self.valid_transform = valid_transform
-        self.test_transform = test_transform if test_transform is not None else valid_transform
-        self.drop_last = drop_last
-        self.repeat_channel = repeat_channel
-        self.prefetch_factor = prefetch_factor
+        self.save_hyperparameters(logger=False)
+
+        self.df_train = self._read_table(os.path.join(self.hparams.mount_point, self.hparams.csv_train))
+        self.df_val = self._read_table(os.path.join(self.hparams.mount_point, self.hparams.csv_valid))
+        self.df_test = (
+            self._read_table(os.path.join(self.hparams.mount_point, self.hparams.csv_test))
+            if getattr(self.hparams, "csv_test", None)
+            else None
+        )
+
+        query = getattr(self.hparams, "query", None)
+        if query:
+            self.df_train = self.df_train.query(query).reset_index(drop=True)
+            self.df_val = self.df_val.query(query).reset_index(drop=True)
+            if self.df_test is not None:
+                self.df_test = self.df_test.query(query).reset_index(drop=True)
+
+        if self.hparams.train_transform == 2:
+            self.train_transform = SimTrainTransformsV2(self.hparams.img_size)
+        else:
+            self.train_transform = SimTrainTransforms(self.hparams.img_size)
+        self.valid_transform = SimEvalTransforms(self.hparams.img_size)
+        self.test_transform = self.valid_transform
+
+    @staticmethod
+    def _read_table(path):
+        if os.path.splitext(path)[1] == ".csv":
+            return pd.read_csv(path)
+        return pd.read_parquet(path)
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("USDataModule")
+        group.add_argument("--mount_point", default="./", type=str, help="Dataset mount directory")
+        group.add_argument("--csv_train", required=True, type=str, help="Train CSV/parquet")
+        group.add_argument("--csv_valid", required=True, type=str, help="Validation CSV/parquet")
+        group.add_argument("--csv_test", default=None, type=str, help="Test CSV/parquet (optional)")
+        group.add_argument("--img_column", default="img_path", type=str, help="Image path column")
+        group.add_argument("--img_size", default=224, type=int, help="Square crop size")
+        group.add_argument("--query", default=None, type=str, help="Optional pandas query filter")
+        group.add_argument("--batch_size", default=256, type=int, help="Batch size")
+        group.add_argument("--num_workers", default=4, type=int, help="Dataloader workers")
+        group.add_argument("--train_transform", default=0, type=int, help="0=default, 2=V2 transforms")
+        group.add_argument("--drop_last", default=1, type=int, help="Drop last incomplete batch")
+        group.add_argument("--repeat_channel", default=1, type=int, help="Repeat grayscale frames to 3 channels")
+        group.add_argument("--prefetch_factor", default=2, type=int, help="Dataloader prefetch factor")
+        return parent_parser
 
     def setup(self, stage=None):
+        repeat_channel = bool(self.hparams.repeat_channel)
         self.train_ds = USDataset(
-            self.df_train, self.mount_point, transform=self.train_transform,
-            img_column=self.img_column, repeat_channel=self.repeat_channel,
+            self.df_train, self.hparams.mount_point, transform=self.train_transform,
+            img_column=self.hparams.img_column, repeat_channel=repeat_channel,
         )
         self.val_ds = USDataset(
-            self.df_val, self.mount_point, transform=self.valid_transform,
-            img_column=self.img_column, repeat_channel=self.repeat_channel,
+            self.df_val, self.hparams.mount_point, transform=self.valid_transform,
+            img_column=self.hparams.img_column, repeat_channel=repeat_channel,
         )
         if self.df_test is not None:
             self.test_ds = USDataset(
-                self.df_test, self.mount_point, transform=self.test_transform,
-                img_column=self.img_column, repeat_channel=self.repeat_channel,
+                self.df_test, self.hparams.mount_point, transform=self.test_transform,
+                img_column=self.hparams.img_column, repeat_channel=repeat_channel,
             )
 
     def _loader(self, ds, shuffle=False):
         return DataLoader(
             ds,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            persistent_workers=self.num_workers > 0,
+            batch_size=self.hparams.batch_size,
+            num_workers=self.hparams.num_workers,
+            persistent_workers=self.hparams.num_workers > 0,
             pin_memory=True,
-            drop_last=self.drop_last,
+            drop_last=bool(self.hparams.drop_last),
             shuffle=shuffle,
-            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+            prefetch_factor=self.hparams.prefetch_factor if self.hparams.num_workers > 0 else None,
         )
 
     def train_dataloader(self):

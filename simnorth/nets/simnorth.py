@@ -7,6 +7,8 @@ are pushed apart with a rank-weighted penalty (uniformity), and a set of fixed
 learned manifold organizes around them.
 """
 
+import pickle
+
 import torch
 from torch import nn
 import torch.optim as optim
@@ -60,62 +62,58 @@ class GaussianNoise(nn.Module):
 class SimNorth(pl.LightningModule):
     """Self-supervised contrastive model with hypersphere "light house" anchors.
 
-    Args:
+    All arguments are passed as keyword arguments (typically ``**vars(args)``
+    from the trainer) and captured via ``save_hyperparameters``. See
+    :meth:`add_model_specific_args` for the available hyperparameters:
+
         base_encoder: Any ``torchvision.models`` constructor name (e.g.
             ``efficientnet_b0``, ``resnet18``). The classifier/fc head is
             replaced with a :class:`ProjectionHead`.
         emb_dim: Dimensionality of the embedding on the hypersphere.
         hidden_dim: Hidden width of the projection head.
-        n_lights: Number of light house anchors (ignored if ``light_house`` is
-            given explicitly).
+        n_lights: Number of light house anchors (ignored if ``lights`` points to
+            a pickled set of anchors).
+        lights: Optional path to a pickle holding ``(n_lights, emb_dim)`` anchor
+            points. If ``None``, anchors are drawn uniformly in ``[0, 1)``.
         lr: AdamW learning rate.
         weight_decay: AdamW weight decay.
-        max_epochs: Used by the cosine annealing scheduler.
+        epochs: Used by the cosine annealing scheduler (``T_max``).
         w: Scale of the rank-based weighting on the contrastive (push) term.
-        light_house: Optional ``(n_lights, emb_dim)`` array of anchor points. If
-            ``None``, anchors are drawn uniformly in ``[0, 1)`` once at init.
     """
 
-    def __init__(
-        self,
-        base_encoder="efficientnet_b0",
-        emb_dim=128,
-        hidden_dim=64,
-        n_lights=64,
-        lr=1e-3,
-        weight_decay=1e-4,
-        max_epochs=50,
-        w=4.0,
-        light_house=None,
-    ):
+    def __init__(self, **kwargs):
         super().__init__()
-        # light_house is stored as a buffer below, not a hyperparameter.
-        self.save_hyperparameters(ignore=["light_house"])
+        self.save_hyperparameters()
 
-        template_model = getattr(torchvision.models, base_encoder)
-        self.convnet = template_model(num_classes=4 * emb_dim)
+        template_model = getattr(torchvision.models, self.hparams.base_encoder)
+        self.convnet = template_model(num_classes=4 * self.hparams.emb_dim)
 
+        proj_head = ProjectionHead(
+            input_dim=4 * self.hparams.emb_dim,
+            hidden_dim=self.hparams.hidden_dim,
+            output_dim=self.hparams.emb_dim,
+        )
         if hasattr(self.convnet, "classifier"):
-            self.convnet.classifier = nn.Sequential(
-                self.convnet.classifier,
-                ProjectionHead(input_dim=4 * emb_dim, hidden_dim=hidden_dim, output_dim=emb_dim),
-            )
+            self.convnet.classifier = nn.Sequential(self.convnet.classifier, proj_head)
         elif hasattr(self.convnet, "fc"):
-            self.convnet.fc = nn.Sequential(
-                self.convnet.fc,
-                ProjectionHead(input_dim=4 * emb_dim, hidden_dim=hidden_dim, output_dim=emb_dim),
-            )
+            self.convnet.fc = nn.Sequential(self.convnet.fc, proj_head)
         else:
-            raise ValueError(f"Unsupported base_encoder '{base_encoder}': no classifier/fc head found.")
+            raise ValueError(
+                f"Unsupported base_encoder '{self.hparams.base_encoder}': no classifier/fc head found."
+            )
 
         self.loss = nn.CosineSimilarity()
 
         self.noise_transform = nn.Sequential(GaussianNoise())
 
-        if light_house is None:
-            light_house = torch.rand(n_lights, emb_dim)
+        lights = getattr(self.hparams, "lights", None)
+        if lights is None:
+            light_house = torch.rand(self.hparams.n_lights, self.hparams.emb_dim)
+        elif isinstance(lights, str):
+            with open(lights, "rb") as f:
+                light_house = torch.as_tensor(pickle.load(f), dtype=torch.float32)
         else:
-            light_house = torch.as_tensor(light_house, dtype=torch.float32)
+            light_house = torch.as_tensor(lights, dtype=torch.float32)
 
         self.register_buffer("light_house", light_house)
 
@@ -128,10 +126,24 @@ class SimNorth(pl.LightningModule):
 
         self.noise_transform_lights = nn.Sequential(GaussianNoise(mean=0.0, std=min_l.item() / 2.0))
 
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("SimNorth")
+        group.add_argument("--base_encoder", default="efficientnet_b0", type=str, help="torchvision encoder")
+        group.add_argument("--emb_dim", default=128, type=int, help="Embedding dimension")
+        group.add_argument("--hidden_dim", default=64, type=int, help="Projection head hidden dim")
+        group.add_argument("--n_lights", default=64, type=int, help="Number of light house anchors")
+        group.add_argument("--lights", default=None, type=str, help="Pickle file with light house anchors")
+        group.add_argument("--w", default=4.0, type=float, help="Weight scale for the contrastive (push) term")
+        group.add_argument("--lr", "--learning-rate", default=1e-4, type=float, help="Learning rate")
+        group.add_argument("--weight_decay", default=1e-4, type=float, help="Weight decay")
+        return parent_parser
+
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        max_epochs = getattr(self.hparams, "epochs", None) or getattr(self.hparams, "max_epochs", None) or 200
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr / 50
+            optimizer, T_max=max_epochs, eta_min=self.hparams.lr / 50
         )
         return [optimizer], [lr_scheduler]
 

@@ -42,6 +42,7 @@ Train:
 
 ```bash
 python train.py \
+    --nn SimNorth --data_module USDataModule \
     --csv_train train.parquet --csv_valid valid.parquet --csv_test test.parquet \
     --mount_point /data/frames \
     --base_encoder efficientnet_b0 --emb_dim 128 --hidden_dim 64 --n_lights 64 \
@@ -49,6 +50,12 @@ python train.py \
     --lights lights.pkl \
     --tracking_uri file:./mlruns --experiment_name SimNorth --run_name effnet_b0
 ```
+
+`--nn` / `--data_module` select the network and data-module classes by name from
+the `simnorth` package; each contributes its own CLI arguments via
+`add_model_specific_args` / `add_data_specific_args` (run `python train.py --help`
+to see them). Both default to `SimNorth` / `USDataModule`, so the flags above are
+optional.
 
 If `--lights` is omitted, anchors are initialized uniformly at random.
 
