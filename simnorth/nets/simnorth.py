@@ -72,9 +72,11 @@ class SimNorth(pl.LightningModule):
         emb_dim: Dimensionality of the embedding on the hypersphere.
         hidden_dim: Hidden width of the projection head.
         n_lights: Number of light house anchors (ignored if ``lights`` points to
-            a pickled set of anchors).
+            a pickled set of anchors). Set ``<= 0`` (with no ``lights`` pickle) to
+            disable the light house term entirely.
         lights: Optional path to a pickle holding ``(n_lights, emb_dim)`` anchor
-            points. If ``None``, anchors are drawn uniformly in ``[0, 1)``.
+            points. If ``None`` and ``n_lights > 0``, anchors are drawn uniformly
+            in ``[0, 1)``; if ``None`` and ``n_lights <= 0`` the term is disabled.
         lr: AdamW learning rate.
         weight_decay: AdamW weight decay.
         epochs: Used by the cosine annealing scheduler (``T_max``).
@@ -106,8 +108,14 @@ class SimNorth(pl.LightningModule):
 
         self.noise_transform = nn.Sequential(GaussianNoise())
 
+        # The light house (north) term is optional. It is enabled when anchors
+        # are supplied via the ``lights`` pickle, or when ``n_lights > 0`` (random
+        # anchors). With no pickle and ``n_lights <= 0`` the model trains on the
+        # alignment + uniformity objectives only.
         lights = getattr(self.hparams, "lights", None)
-        if lights is None:
+        if lights is None and self.hparams.n_lights <= 0:
+            light_house = None
+        elif lights is None:
             light_house = torch.rand(self.hparams.n_lights, self.hparams.emb_dim)
         elif isinstance(lights, str):
             with open(lights, "rb") as f:
@@ -117,14 +125,18 @@ class SimNorth(pl.LightningModule):
 
         self.register_buffer("light_house", light_house)
 
-        # Scale the light-house jitter to half the smallest inter-anchor distance
-        # so the noise never lets one anchor wander into another's basin.
-        min_l = torch.tensor(float("inf"))
-        for idx, l in enumerate(light_house):
-            lights_ex = torch.cat([light_house[:idx], light_house[idx + 1:]])
-            min_l = torch.minimum(min_l, torch.min(torch.sum(torch.square(l - lights_ex), dim=1)))
+        if light_house is None:
+            self.noise_transform_lights = None
+        else:
+            # Scale the light-house jitter to half the smallest inter-anchor
+            # distance so the noise never lets one anchor wander into another's
+            # basin.
+            min_l = torch.tensor(float("inf"))
+            for idx, l in enumerate(light_house):
+                lights_ex = torch.cat([light_house[:idx], light_house[idx + 1:]])
+                min_l = torch.minimum(min_l, torch.min(torch.sum(torch.square(l - lights_ex), dim=1)))
 
-        self.noise_transform_lights = nn.Sequential(GaussianNoise(mean=0.0, std=min_l.item() / 2.0))
+            self.noise_transform_lights = nn.Sequential(GaussianNoise(mean=0.0, std=min_l.item() / 2.0))
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -132,7 +144,7 @@ class SimNorth(pl.LightningModule):
         group.add_argument("--base_encoder", default="efficientnet_b0", type=str, help="torchvision encoder")
         group.add_argument("--emb_dim", default=128, type=int, help="Embedding dimension")
         group.add_argument("--hidden_dim", default=64, type=int, help="Projection head hidden dim")
-        group.add_argument("--n_lights", default=64, type=int, help="Number of light house anchors")
+        group.add_argument("--n_lights", default=64, type=int, help="Number of light house anchors (<=0 disables the light house term)")
         group.add_argument("--lights", default=None, type=str, help="Pickle file with light house anchors")
         group.add_argument("--w", default=4.0, type=float, help="Weight scale for the contrastive (push) term")
         group.add_argument("--lr", "--learning-rate", default=1e-4, type=float, help="Learning rate")
@@ -173,25 +185,7 @@ class SimNorth(pl.LightningModule):
         w = torch.square(torch.arange(batch_size, device=self.device) / batch_size - 1.0) * self.hparams.w
         loss_proj_c = torch.sum(w * torch.square(loss_proj_c))
 
-        # --- North / light house: each anchor attracts its single closest
-        #     embedding from each view, organizing the manifold around anchors.
-        loss_north = []
-        light_house = self.noise_transform_lights(self.light_house)
-        for lh in light_house:
-            l_north = self.loss(z_0, lh)
-            nearest_z0 = torch.argsort(l_north)[-1]  # most similar embedding
-            loss_north.append(1.0 - l_north[nearest_z0])  # pull it closer
-
-            l_north = self.loss(z_1, lh)
-            nearest_z1 = torch.argsort(l_north)[-1]
-            loss_north.append(1.0 - l_north[nearest_z1])  # pull it closer
-
-        loss_north = torch.stack(loss_north)
-        loss_north_mean = torch.mean(loss_north)
-        loss_north_std = torch.std(loss_north)
-        loss_north = torch.square(torch.sum(loss_north))
-
-        loss = loss_proj + loss_proj_c + loss_north
+        loss = loss_proj + loss_proj_c
 
         self.log(mode + "_loss_proj", loss_proj, sync_dist=True)
         self.log(mode + "_loss_proj_mean", loss_proj_mean, sync_dist=True)
@@ -199,9 +193,33 @@ class SimNorth(pl.LightningModule):
         self.log(mode + "_loss_proj_c", loss_proj_c, sync_dist=True)
         self.log(mode + "_loss_proj_c_mean", loss_proj_c_mean, sync_dist=True)
         self.log(mode + "_loss_proj_c_std", loss_proj_c_std, sync_dist=True)
-        self.log(mode + "_loss_north_mean", loss_north_mean, sync_dist=True)
-        self.log(mode + "_loss_north_std", loss_north_std, sync_dist=True)
-        self.log(mode + "_loss_north", loss_north, sync_dist=True)
+
+        # --- North / light house (optional): each anchor attracts its single
+        #     closest embedding from each view, organizing the manifold around
+        #     anchors. Skipped when no light house is configured.
+        if self.light_house is not None:
+            loss_north = []
+            light_house = self.noise_transform_lights(self.light_house)
+            for lh in light_house:
+                l_north = self.loss(z_0, lh)
+                nearest_z0 = torch.argsort(l_north)[-1]  # most similar embedding
+                loss_north.append(1.0 - l_north[nearest_z0])  # pull it closer
+
+                l_north = self.loss(z_1, lh)
+                nearest_z1 = torch.argsort(l_north)[-1]
+                loss_north.append(1.0 - l_north[nearest_z1])  # pull it closer
+
+            loss_north = torch.stack(loss_north)
+            loss_north_mean = torch.mean(loss_north)
+            loss_north_std = torch.std(loss_north)
+            loss_north = torch.square(torch.sum(loss_north))
+
+            loss = loss + loss_north
+
+            self.log(mode + "_loss_north_mean", loss_north_mean, sync_dist=True)
+            self.log(mode + "_loss_north_std", loss_north_std, sync_dist=True)
+            self.log(mode + "_loss_north", loss_north, sync_dist=True)
+
         self.log(mode + "_loss", loss, sync_dist=True)
 
         return loss

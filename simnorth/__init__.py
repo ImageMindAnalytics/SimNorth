@@ -1,6 +1,6 @@
 from .nets.simnorth import SimNorth, ProjectionHead, GaussianNoise
 from .nets.lighthouse import LightHouse
-from .data.dataset import USDataset, USDataModule
+from .data.dataset import USDataset, USDataModule, USDatasetBlindSweep, USDataModuleBlindSweep
 from .data.transforms import (
     SimTrainTransforms,
     SimTrainTransformsV2,
@@ -16,6 +16,8 @@ __all__ = [
     "LightHouse",
     "USDataset",
     "USDataModule",
+    "USDatasetBlindSweep",
+    "USDataModuleBlindSweep",
     "SimTrainTransforms",
     "SimTrainTransformsV2",
     "SimEvalTransforms",
