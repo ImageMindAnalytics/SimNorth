@@ -43,7 +43,7 @@ def add_train_args(parser):
 
     input_group = parser.add_argument_group("Input")
     input_group.add_argument("--nn", default="SimNorth", type=str, help="Network class name in the simnorth package")
-    input_group.add_argument("--data_module", default="USDataModule", type=str, help="Data module class name in the simnorth package")
+    input_group.add_argument("--data_module", default="USDataModuleBlindSweep", type=str, help="Data module class name in the simnorth package")
     input_group.add_argument("--model", default=None, type=str, help="Checkpoint to resume from")
 
     output_group = parser.add_argument_group("Output")
