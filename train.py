@@ -35,7 +35,7 @@ def add_train_args(parser):
     """Add generic (network/data-module agnostic) training args. Returns the parser."""
     hparams_group = parser.add_argument_group("Hyperparameters")
     hparams_group.add_argument("--epochs", default=200, type=int, help="Max epochs")
-    hparams_group.add_argument("--steps", default=-1, type=int, help="Max steps (-1 = unlimited)")
+    hparams_group.add_argument("--steps", default=None, type=int, help="Max steps per epoch")
     hparams_group.add_argument("--patience", default=30, type=int, help="Early stopping patience")
     hparams_group.add_argument("--seed_everything", default=None, type=int, help="Seed for reproducibility")
     hparams_group.add_argument("--find_unused_parameters", default=0, type=int, help="DDP find_unused_parameters")
@@ -101,7 +101,7 @@ def main(args):
         logger=logger,
         log_every_n_steps=args.log_steps,
         max_epochs=args.epochs,
-        max_steps=args.steps,
+        limit_train_batches=args.steps,
         callbacks=[early_stop_callback, checkpoint_callback, image_logger, best_tracker],
         accelerator="gpu",
         devices=torch.cuda.device_count(),

@@ -78,7 +78,13 @@ class USDatasetBlindSweep(Dataset):
         img_path = os.path.join(self.mount_point, self.df.iloc[idx][self.img_column])
 
         try:
-            img_t = torch.tensor(sitk.GetArrayFromImage(sitk.ReadImage(img_path)), dtype=torch.float32)
+
+            img = sitk.ReadImage(img_path)                                         
+            img_t = torch.from_numpy(sitk.GetArrayFromImage(img)).float()
+
+            if (img.GetNumberOfComponentsPerPixel() > 1): #grab the first component
+                img_t = img_t[:, :, :, 0]
+
             if self.num_frames > 0:
                 frame_idx = torch.randint(low=0, high=img_t.shape[0], size=(self.num_frames,)).sort().values
                 img_t = img_t[frame_idx]
@@ -86,12 +92,12 @@ class USDatasetBlindSweep(Dataset):
             print("Error reading cine: " + img_path, file=sys.stderr)
             img_t = torch.zeros(self.num_frames, 256, 256, dtype=torch.float32)
 
-        # Promote grayscale frames to 3 channels -> (num_frames, 3, H, W).
+        img_t = img_t.unsqueeze(1) #Add channel
         if self.repeat_channel:
-            img_t = img_t.unsqueeze(1).repeat(1, 3, 1, 1).contiguous()
-
+            img_t = img_t.repeat(1, 3, 1, 1)
+        
         if self.transform:
-            img_t = self.transform(img_t)
+            img_t = self.transform(img_t)       
 
         # The pair transform returns two augmented views (q, k).
         if isinstance(img_t, (tuple, list)):
@@ -106,8 +112,10 @@ class USDatasetBlindSweep(Dataset):
         frame axis yields ``(sum_frames, 3, H, W)`` tensors, matching the shape
         ``SimNorth.training_step`` expects.
         """
+        
         x_0 = torch.cat([b["img_0"] for b in batch], dim=0)
         x_1 = torch.cat([b["img_1"] for b in batch], dim=0)
+        
         return x_0, x_1
 
 

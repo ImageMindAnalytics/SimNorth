@@ -270,6 +270,7 @@ class SimNorth(pl.LightningModule):
         return self.compute_loss(x_0, x_1, mode="train")
 
     def validation_step(self, batch, batch_idx):
+        
         x_0, x_1 = batch
         self.compute_loss(x_0, x_1, mode="val")
 
