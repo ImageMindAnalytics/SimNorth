@@ -290,7 +290,7 @@ class SimNorth(pl.LightningModule):
         # Keep val_n_clusters present from epoch 0 (so EarlyStopping/ModelCheckpoint
         # can monitor it), but neutral until the warmup starts collecting features.
         if not self._cluster_validation_active():
-            self.log("val_n_clusters", 0.0, sync_dist=True, prog_bar=True)
+            self.log("val_n_clusters", 0.0, sync_dist=False, prog_bar=True)
             self.log("val_silhouette", -1.0, sync_dist=False)
             return
 
