@@ -19,6 +19,16 @@ from lightning.pytorch import LightningDataModule
 from .transforms import SimTrainTransforms, SimTrainTransformsV2, SimEvalTransforms
 
 
+def _worker_init(_):
+    """Pin ITK to a single thread inside each DataLoader worker.
+
+    Forked workers can inherit a locked ITK/OpenMP thread-pool mutex and deadlock
+    on the first ``ReadImage``; disabling ITK's thread pool avoids this (and the
+    thread oversubscription from one pool per worker).
+    """
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+
+
 class USDataset(Dataset):
     def __init__(self, df, mount_point="./", transform=None, img_column="img_path", repeat_channel=True):
         self.df = df
@@ -200,6 +210,7 @@ class USDataModule(LightningDataModule):
             drop_last=bool(self.hparams.drop_last),
             shuffle=shuffle,
             prefetch_factor=self.hparams.prefetch_factor if self.hparams.num_workers > 0 else None,
+            worker_init_fn=_worker_init,
         )
 
     def train_dataloader(self):
@@ -266,4 +277,5 @@ class USDataModuleBlindSweep(USDataModule):
             shuffle=shuffle,
             prefetch_factor=self.hparams.prefetch_factor if self.hparams.num_workers > 0 else None,
             collate_fn=USDatasetBlindSweep.collate_fn,
+            worker_init_fn=_worker_init,
         )
