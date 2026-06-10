@@ -206,7 +206,7 @@ class USDataModule(LightningDataModule):
         return self._loader(self.train_ds, shuffle=True)
 
     def val_dataloader(self):
-        return self._loader(self.val_ds)
+        return self._loader(self.val_ds, shuffle=True)
 
     def test_dataloader(self):
         return self._loader(self.test_ds)

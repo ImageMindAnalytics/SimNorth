@@ -36,6 +36,7 @@ def add_train_args(parser):
     hparams_group = parser.add_argument_group("Hyperparameters")
     hparams_group.add_argument("--epochs", default=200, type=int, help="Max epochs")
     hparams_group.add_argument("--steps", default=None, type=int, help="Max steps per epoch")
+    hparams_group.add_argument("--valid_steps", default=None, type=int, help="Max validation steps per epoch")
     hparams_group.add_argument("--patience", default=30, type=int, help="Early stopping patience")
     hparams_group.add_argument("--seed_everything", default=None, type=int, help="Seed for reproducibility")
     hparams_group.add_argument("--find_unused_parameters", default=0, type=int, help="DDP find_unused_parameters")
@@ -102,6 +103,7 @@ def main(args):
         log_every_n_steps=args.log_steps,
         max_epochs=args.epochs,
         limit_train_batches=args.steps,
+        limit_val_batches=args.valid_steps,
         callbacks=[early_stop_callback, checkpoint_callback, image_logger, best_tracker],
         accelerator="gpu",
         devices=torch.cuda.device_count(),
