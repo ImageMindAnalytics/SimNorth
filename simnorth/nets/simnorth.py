@@ -312,31 +312,80 @@ class SimNorth(pl.LightningModule):
 
     def _optimal_n_clusters(self, features):
         """Silhouette-optimal KMeans cluster count over a random subset of the
-        gathered validation embeddings. Returns ``(n_clusters, silhouette)``."""
-        from sklearn.cluster import KMeans
-        from sklearn.metrics import silhouette_score
+        gathered validation embeddings. Returns ``(n_clusters, silhouette)``.
 
-        feats = features.detach().float().cpu()
+        Clustering uses GPU-friendly ``torch_kmeans.KMeans`` and the silhouette
+        coefficient is computed in pure torch (see :meth:`_silhouette_score`),
+        so the whole search stays on-device with no sklearn dependency."""
+        from torch_kmeans import KMeans
+
+        feats = features.detach().float().to(self.device)
         n = self.hparams.n_cluster_samples
         if 0 < n < feats.shape[0]:
-            feats = feats[torch.randperm(feats.shape[0])[:n]]
-        feats = feats.numpy()
+            feats = feats[torch.randperm(feats.shape[0], device=feats.device)[:n]]
 
         if feats.shape[0] <= self.hparams.n_clusters_min:
             return 0.0, -1.0
 
         k_max = min(self.hparams.n_clusters_max, feats.shape[0] - 1)
+        # torch-kmeans expects a batch of datasets, shape (B, N, D).
+        x = feats.unsqueeze(0)
         best_k, best_score = 0, -1.0
         for k in range(self.hparams.n_clusters_min, k_max + 1):
-            labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(feats)
+            # num_init/seed mirror sklearn's n_init/random_state; the default
+            # LpDistance(p_norm=2) matches sklearn's euclidean metric.
+            model = KMeans(n_clusters=k, num_init=10, seed=0, verbose=False)
+            labels = model(x).labels[0]
             # KMeans can leave clusters empty on degenerate (e.g. collapsed,
-            # untrained) embeddings; silhouette needs 2..n_samples-1 labels.
-            if len(set(labels)) < 2:
+            # untrained) embeddings; silhouette needs at least 2 populated clusters.
+            if torch.unique(labels).numel() < 2:
                 continue
-            score = silhouette_score(feats, labels)
+            score = self._silhouette_score(feats, labels)
+            if torch.isnan(score):
+                continue
+            score = float(score)
             if score > best_score:
                 best_score, best_k = score, k
         return float(best_k), float(best_score)
+
+    @staticmethod
+    def _silhouette_score(feats, labels):
+        """Mean silhouette coefficient (euclidean), computed entirely in torch.
+
+        Mirrors ``sklearn.metrics.silhouette_score``: each sample scores
+        ``s = (b - a) / max(a, b)`` where ``a`` is its mean intra-cluster
+        distance and ``b`` its mean distance to the nearest other cluster;
+        singleton clusters score 0 and the per-sample scores are averaged.
+        Returns ``nan`` when fewer than two clusters are present.
+        """
+        unique = torch.unique(labels)  # sorted, so searchsorted yields 0..K-1
+        n_clusters = unique.numel()
+        if n_clusters < 2:
+            return feats.new_tensor(float("nan"))
+
+        label_idx = torch.searchsorted(unique, labels)
+        onehot = F.one_hot(label_idx, n_clusters).to(feats.dtype)  # (N, K)
+        cluster_sizes = onehot.sum(dim=0)  # (K,)
+
+        dist = torch.cdist(feats, feats)  # (N, N) euclidean
+        dist_to_cluster = dist @ onehot  # (N, K) summed distance to each cluster
+
+        own = onehot.bool()  # (N, K), one True per row
+        own_size = cluster_sizes[label_idx]  # (N,)
+
+        # a: mean intra-cluster distance (self-distance is 0, so excluded).
+        a = dist_to_cluster[own] / (own_size - 1).clamp(min=1)
+
+        # b: smallest mean distance to any *other* cluster.
+        mean_to_cluster = dist_to_cluster / cluster_sizes.clamp(min=1)  # (N, K)
+        mean_to_cluster = mean_to_cluster.masked_fill(own, float("inf"))
+        b = mean_to_cluster.min(dim=1).values  # (N,)
+
+        denom = torch.maximum(a, b)
+        s = torch.where(denom > 0, (b - a) / denom, torch.zeros_like(denom))
+        # Singleton clusters contribute 0 by convention.
+        s = torch.where(own_size > 1, s, torch.zeros_like(s))
+        return s.mean()
 
     def forward(self, x):
         return self.convnet(x)
