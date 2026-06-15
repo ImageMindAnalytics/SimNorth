@@ -13,7 +13,6 @@ Logs to MLflow. Example:
         --mount_point /data/frames \
         --base_encoder efficientnet_b0 --emb_dim 128 \
         --batch_size 256 --epochs 200 --warmup_epochs 20 \
-        --tracking_uri file:./mlruns --experiment_name SimNorth --run_name effnet_b0
 """
 
 import argparse
@@ -30,6 +29,23 @@ from lightning.pytorch.loggers import MLFlowLogger
 import simnorth
 from simnorth import SimNorthImageLogger, BestMetricTracker
 
+def _parse_kv_tags(pairs):
+    """
+    Parse a list like ["k=v", "foo=bar"] into a dict.
+    Ignores malformed entries rather than failing training.
+    """
+    if not pairs:
+        return None
+    tags = {}
+    for item in pairs:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k:
+            tags[k] = v
+    return tags or None
 
 def add_train_args(parser):
     """Add generic (network/data-module agnostic) training args. Returns the parser."""
@@ -55,8 +71,8 @@ def add_train_args(parser):
 
     log_group = parser.add_argument_group("Logging")
     log_group.add_argument("--tracking_uri", default="file:./mlruns", type=str, help="MLflow tracking URI")
-    log_group.add_argument("--experiment_name", default="SimNorth", type=str, help="MLflow experiment name")
-    log_group.add_argument("--run_name", default=None, type=str, help="MLflow run name")
+    log_group.add_argument("--mlflow_experiment", default="SimNorth", type=str, help="MLflow experiment name")
+    log_group.add_argument('--mlflow_tags', type=str, nargs='+', help='MLflow tags as key=value pairs', default=None)
     log_group.add_argument("--log_steps", default=5, type=int, help="Log scalars every N steps")
     log_group.add_argument("--image_log_steps", default=100, type=int, help="Log image grids every N steps")
     return parser
@@ -91,15 +107,17 @@ def main(args):
     image_logger = SimNorthImageLogger(log_steps=args.image_log_steps)
     best_tracker = BestMetricTracker(monitor=args.monitor, mode=args.monitor_mode)
 
-    logger = MLFlowLogger(
-        experiment_name=args.experiment_name,
-        run_name=args.run_name,
-        tracking_uri=os.getenv("MLFLOW_TRACKING_URI", args.tracking_uri),
-        log_model=True,
-    )
+    logger_mlflow = None
+
+    if args.mlflow_experiment:
+        logger_mlflow = MLFlowLogger(
+            tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+            experiment_name=args.mlflow_experiment,
+            tags=_parse_kv_tags(args.mlflow_tags),
+        )
 
     trainer = Trainer(
-        logger=logger,
+        logger=logger_mlflow,
         log_every_n_steps=args.log_steps,
         max_epochs=args.epochs,
         limit_train_batches=args.steps,
