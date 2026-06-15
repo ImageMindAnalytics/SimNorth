@@ -1,20 +1,27 @@
 """SimNorth contrastive self-supervised model.
 
-SimNorth learns ultrasound frame embeddings on a hypersphere. Two augmented
-views of the same frame are pulled together (alignment), randomly paired views
-are pushed apart with a rank-weighted penalty (uniformity), and a set of fixed
-"light house" anchors on the sphere attract their nearest embeddings so the
-learned manifold organizes around them.
+SimNorth learns ultrasound frame embeddings on the unit hypersphere. Two
+augmented views of the same frame are pulled together (alignment), randomly
+paired views are pushed apart with a rank-weighted penalty (uniformity), and a
+prototypical-contrastive term (ProtoNCE) pulls each embedding toward the
+data-driven cluster centroid it belongs to.
 
-Validation also reports a cluster-count metric: after ``warmup_epochs``,
-validation embeddings are tracked with a ``CatMetric`` (gathered across all
-ranks for multi-GPU training); on rank 0 a random subset of up to
-``n_cluster_samples`` is taken and the silhouette-optimal number of KMeans
-clusters is logged as ``val_n_clusters`` (monitor with ``mode="max"`` to favor
-more well-separated clusters).
+The prototypes follow the Expectation-Maximization scheme of Prototypical
+Contrastive Learning (Li et al., ICLR 2021, ``simnorth/docs/2005.04966v5.pdf``):
+at the end of each validation epoch (E-step), embeddings gathered across all
+ranks with a ``CatMetric`` are clustered with KMeans into ``M`` granularities,
+and each centroid's concentration ``phi`` is estimated; during the next epoch
+(M-step) the ProtoNCE term contrastively pulls embeddings toward their assigned
+centroid scaled by ``phi``. Clustering is bootstrapped by ``warmup_epochs`` of
+alignment + uniformity only, so the prototype term is inactive (contributes 0)
+until then.
+
+The same E-step also reports a silhouette-optimal cluster-count metric as
+``val_n_clusters`` (monitor with ``mode="max"`` to favor well-separated
+clusters) and ``val_silhouette``.
 """
 
-import pickle
+import math
 
 import torch
 from torch import nn
@@ -30,8 +37,8 @@ from torchmetrics.aggregation import CatMetric
 class ProjectionHead(nn.Module):
     """MLP projection head that maps encoder features onto the unit hypersphere.
 
-    The output is passed through ``abs`` before normalization so embeddings live
-    on the positive orthant of the sphere (where the light houses are sampled).
+    The output is L2-normalized so embeddings live on the full unit sphere
+    (data-driven prototypes are not confined to any orthant).
     """
 
     def __init__(self, input_dim=1280, hidden_dim=1280, output_dim=128):
@@ -49,7 +56,6 @@ class ProjectionHead(nn.Module):
 
     def forward(self, x):
         x = self.model(x)
-        x = torch.abs(x)
         return F.normalize(x, dim=1)
 
 
@@ -68,7 +74,7 @@ class GaussianNoise(nn.Module):
 
 
 class SimNorth(pl.LightningModule):
-    """Self-supervised contrastive model with hypersphere "light house" anchors.
+    """Self-supervised contrastive model with data-driven prototypes (ProtoNCE).
 
     All arguments are passed as keyword arguments (typically ``**vars(args)``
     from the trainer) and captured via ``save_hyperparameters``. See
@@ -79,16 +85,22 @@ class SimNorth(pl.LightningModule):
             replaced with a :class:`ProjectionHead`.
         emb_dim: Dimensionality of the embedding on the hypersphere.
         hidden_dim: Hidden width of the projection head.
-        n_lights: Number of light house anchors (ignored if ``lights`` points to
-            a pickled set of anchors). Set ``<= 0`` (with no ``lights`` pickle) to
-            disable the light house term entirely.
-        lights: Optional path to a pickle holding ``(n_lights, emb_dim)`` anchor
-            points. If ``None`` and ``n_lights > 0``, anchors are drawn uniformly
-            in ``[0, 1)``; if ``None`` and ``n_lights <= 0`` the term is disabled.
         lr: AdamW learning rate.
         weight_decay: AdamW weight decay.
         epochs: Used by the cosine annealing scheduler (``T_max``).
         w: Scale of the rank-based weighting on the contrastive (push) term.
+        proto_clusters: Comma-separated list of cluster counts ``K`` for the
+            ProtoNCE term (e.g. ``"8,16,32"``). Empty derives ``{k*, 2k*, 4k*}``
+            from the silhouette-optimal ``k*``.
+        proto_samples: Embeddings sampled for the prototype k-means E-step
+            (``<= 0`` uses all gathered embeddings). Decoupled from the O(N^2)
+            silhouette metric's ``n_cluster_samples`` so prototypes can be
+            estimated from many more points without the quadratic cost.
+        proto_tau: Instance temperature / mean to which each clustering's
+            concentrations ``phi`` are normalized.
+        proto_alpha: Concentration smoothing (eq. 12) so small clusters do not
+            get an overly large ``phi``.
+        proto_weight: Weight of the ProtoNCE term in the total loss.
     """
 
     def __init__(self, **kwargs):
@@ -116,38 +128,16 @@ class SimNorth(pl.LightningModule):
 
         self.noise_transform = nn.Sequential(GaussianNoise())
 
-        # The light house (north) term is optional. It is enabled when anchors
-        # are supplied via the ``lights`` pickle, or when ``n_lights > 0`` (random
-        # anchors). With no pickle and ``n_lights <= 0`` the model trains on the
-        # alignment + uniformity objectives only.
-        lights = getattr(self.hparams, "lights", None)
-        if lights is None and self.hparams.n_lights <= 0:
-            light_house = None
-        elif lights is None:
-            light_house = torch.rand(self.hparams.n_lights, self.hparams.emb_dim)
-        elif isinstance(lights, str):
-            with open(lights, "rb") as f:
-                light_house = torch.as_tensor(pickle.load(f), dtype=torch.float32)
-        else:
-            light_house = torch.as_tensor(lights, dtype=torch.float32)
+        # Prototypes (cluster centroids) and their concentrations, re-estimated
+        # each validation epoch (E-step). One (centroids, phi) pair per
+        # granularity in ``K``. Empty until the warmup completes; the ProtoNCE
+        # term contributes 0 while empty. Not checkpointed -- recomputed on the
+        # first validation epoch after a resume.
+        self._prototypes = []      # list of (k_m, emb_dim) tensors, L2-normalized
+        self._concentrations = []  # list of (k_m,) tensors
 
-        self.register_buffer("light_house", light_house)
-
-        if light_house is None:
-            self.noise_transform_lights = None
-        else:
-            # Scale the light-house jitter to half the smallest inter-anchor
-            # distance so the noise never lets one anchor wander into another's
-            # basin.
-            min_l = torch.tensor(float("inf"))
-            for idx, l in enumerate(light_house):
-                lights_ex = torch.cat([light_house[:idx], light_house[idx + 1:]])
-                min_l = torch.minimum(min_l, torch.min(torch.sum(torch.square(l - lights_ex), dim=1)))
-
-            self.noise_transform_lights = nn.Sequential(GaussianNoise(mean=0.0, std=min_l.item() / 2.0))
-
-        # Validation embeddings for the cluster-count metric. CatMetric gathers
-        # and concatenates across all ranks (DDP-safe) when computed.
+        # Validation embeddings for the E-step and cluster-count metric.
+        # CatMetric gathers and concatenates across all ranks (DDP-safe) on compute.
         self.val_features = CatMetric()
 
     @staticmethod
@@ -156,16 +146,23 @@ class SimNorth(pl.LightningModule):
         group.add_argument("--base_encoder", default="efficientnet_b0", type=str, help="torchvision encoder")
         group.add_argument("--emb_dim", default=128, type=int, help="Embedding dimension")
         group.add_argument("--hidden_dim", default=64, type=int, help="Projection head hidden dim")
-        group.add_argument("--n_lights", default=64, type=int, help="Number of light house anchors (<=0 disables the light house term)")
-        group.add_argument("--lights", default=None, type=str, help="Pickle file with light house anchors")
         group.add_argument("--w", default=4.0, type=float, help="Weight scale for the contrastive (push) term")
         group.add_argument("--lr", "--learning-rate", default=1e-4, type=float, help="Learning rate")
         group.add_argument("--weight_decay", default=1e-4, type=float, help="Weight decay")
 
-        # Cluster-count validation: after a warmup, reservoir-sample validation
-        # embeddings and report the silhouette-optimal number of clusters.
-        group.add_argument("--warmup_epochs", default=10, type=int, help="Start cluster-count validation after this many epochs")
-        group.add_argument("--n_cluster_samples", default=1024, type=int, help="Embeddings to reservoir-sample for cluster validation (<=0 disables)")
+        # ProtoNCE (prototypical contrastive) term. Clustering is gated by
+        # ``warmup_epochs``; the term is inactive until then.
+        group.add_argument("--proto_clusters", default="", type=str, help="Comma-separated cluster counts K (e.g. '8,16,32'); empty derives {k*,2k*,4k*} from the silhouette-optimal k*")
+        group.add_argument("--proto_samples", default=4096, type=int, help="Embeddings to sample for the prototype k-means E-step (<=0 uses all gathered embeddings). Decoupled from the O(N^2) silhouette metric's --n_cluster_samples.")
+        group.add_argument("--proto_tau", default=0.1, type=float, help="Instance temperature / mean concentration the phi's are normalized to")
+        group.add_argument("--proto_alpha", default=10.0, type=float, help="Concentration smoothing (eq. 12)")
+        group.add_argument("--proto_weight", default=1.0, type=float, help="Weight of the ProtoNCE term in the total loss")
+
+        # Cluster-count validation: after a warmup, sample validation embeddings
+        # and report the silhouette-optimal number of clusters. This is also the
+        # master switch / warmup gate for the prototype E-step (see _proto_loss).
+        group.add_argument("--warmup_epochs", default=10, type=int, help="Start clustering (silhouette metric + prototype E-step) after this many epochs")
+        group.add_argument("--n_cluster_samples", default=4096, type=int, help="Embeddings to sample for the O(N^2) silhouette metric (<=0 disables clustering, including the prototype term)")
         group.add_argument("--n_clusters_min", default=2, type=int, help="Minimum k for the silhouette search")
         group.add_argument("--n_clusters_max", default=20, type=int, help="Maximum k for the silhouette search")
         return parent_parser
@@ -186,8 +183,9 @@ class SimNorth(pl.LightningModule):
             ),
             "emb_dim": trial.suggest_categorical("emb_dim", [64, 128, 256]),
             "hidden_dim": trial.suggest_categorical("hidden_dim", [64, 128, 256]),
-            "n_lights": trial.suggest_int("n_lights", 0, 128, step=16),
             "w": trial.suggest_float("w", 0.5, 8.0, log=True),
+            "proto_weight": trial.suggest_float("proto_weight", 0.1, 4.0, log=True),
+            "proto_tau": trial.suggest_float("proto_tau", 0.05, 0.5, log=True),
             "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
         }
@@ -203,6 +201,10 @@ class SimNorth(pl.LightningModule):
     def compute_loss(self, x_0, x_1, mode):
         batch_size = x_0.size(0)
 
+        # Only sync logged metrics across ranks for the epoch-level validation
+        # aggregates; per-step training logs avoid the all-reduce overhead.
+        sync = mode != "train"
+
         x = torch.cat([x_0, x_1], dim=0)
         z = self(self.noise_transform(x))
         z_0, z_1 = torch.split(z, batch_size)
@@ -214,7 +216,9 @@ class SimNorth(pl.LightningModule):
         loss_proj = torch.sum(torch.square(1.0 - loss_proj))
 
         # --- Uniformity: random pairs are pushed apart, rank-weighted so the
-        #     most-similar (likely true-negative) random pairs are penalized most.
+        #     most-similar random pairs (likely false negatives -- semantically
+        #     related, so we don't want to force them apart) are penalized least,
+        #     while the most-different pairs are penalized most.
         r = torch.randperm(batch_size)
         z_0_r = z_0[r]
         loss_proj_c = self.loss(z_0_r, z_1)
@@ -228,42 +232,41 @@ class SimNorth(pl.LightningModule):
 
         loss = loss_proj + loss_proj_c
 
-        self.log(mode + "_loss_proj", loss_proj, sync_dist=True)
-        self.log(mode + "_loss_proj_mean", loss_proj_mean, sync_dist=True)
-        self.log(mode + "_loss_proj_std", loss_proj_std, sync_dist=True)
-        self.log(mode + "_loss_proj_c", loss_proj_c, sync_dist=True)
-        self.log(mode + "_loss_proj_c_mean", loss_proj_c_mean, sync_dist=True)
-        self.log(mode + "_loss_proj_c_std", loss_proj_c_std, sync_dist=True)
+        self.log(mode + "_loss_proj", loss_proj, sync_dist=sync)
+        self.log(mode + "_loss_proj_mean", loss_proj_mean, sync_dist=sync)
+        self.log(mode + "_loss_proj_std", loss_proj_std, sync_dist=sync)
+        self.log(mode + "_loss_proj_c", loss_proj_c, sync_dist=sync)
+        self.log(mode + "_loss_proj_c_mean", loss_proj_c_mean, sync_dist=sync)
+        self.log(mode + "_loss_proj_c_std", loss_proj_c_std, sync_dist=sync)
 
-        # --- North / light house (optional): each anchor attracts its single
-        #     closest embedding from each view, organizing the manifold around
-        #     anchors. Skipped when no light house is configured.
-        if self.light_house is not None:
-            loss_north = []
-            light_house = self.noise_transform_lights(self.light_house)
-            for lh in light_house:
-                l_north = self.loss(z_0, lh)
-                nearest_z0 = torch.argsort(l_north)[-1]  # most similar embedding
-                loss_north.append(1.0 - l_north[nearest_z0])  # pull it closer
+        # --- ProtoNCE (north): pull every embedding toward its assigned cluster
+        #     centroid, scaled by the centroid's concentration. Inactive (no
+        #     prototypes) until the warmup completes and the first E-step runs.
+        if self._prototypes:
+            loss_proto = self._proto_loss(z)
+            loss = loss + self.hparams.proto_weight * loss_proto
+            self.log(mode + "_loss_proto", loss_proto, sync_dist=sync)
 
-                l_north = self.loss(z_1, lh)
-                nearest_z1 = torch.argsort(l_north)[-1]
-                loss_north.append(1.0 - l_north[nearest_z1])  # pull it closer
-
-            loss_north = torch.stack(loss_north)
-            loss_north_mean = torch.mean(loss_north)
-            loss_north_std = torch.std(loss_north)
-            loss_north = torch.square(torch.sum(loss_north))
-
-            loss = loss + loss_north
-
-            self.log(mode + "_loss_north_mean", loss_north_mean, sync_dist=True)
-            self.log(mode + "_loss_north_std", loss_north_std, sync_dist=True)
-            self.log(mode + "_loss_north", loss_north, sync_dist=True)
-
-        self.log(mode + "_loss", loss, sync_dist=True)
+        self.log(mode + "_loss", loss, sync_dist=sync)
 
         return loss
+
+    def _proto_loss(self, z):
+        """ProtoNCE prototype term (eq. 11, prototype part) averaged over the
+        ``M`` clustering granularities.
+
+        Each embedding is hard-assigned to its nearest centroid (cosine) and a
+        cross-entropy pulls it toward that centroid while pushing it from the
+        others, with per-centroid concentration ``phi`` acting as temperature.
+        Centroids carry no gradient (fixed during the M-step)."""
+        total = z.new_zeros(())
+        for centroids, phi in zip(self._prototypes, self._concentrations):
+            centroids = centroids.to(z.device)
+            phi = phi.to(z.device)
+            logits = (z @ centroids.t()) / phi.clamp_min(1e-4)  # (N, k)
+            assign = logits.argmax(dim=1)
+            total = total + F.cross_entropy(logits, assign)
+        return total / len(self._prototypes)
 
     def training_step(self, batch, batch_idx):
         x_0, x_1 = batch
@@ -300,15 +303,92 @@ class SimNorth(pl.LightningModule):
         self.val_features.reset()
 
         n_clusters, silhouette = 0.0, -1.0
+        prototypes, concentrations = [], []
         if self.trainer.is_global_zero:
             n_clusters, silhouette = self._optimal_n_clusters(features)
+            # E-step: cluster the gathered embeddings into the ProtoNCE
+            # granularities and estimate each centroid's concentration.
+            prototypes, concentrations = self._compute_prototypes(features, n_clusters)
 
-        # Broadcast the rank-0 result so the monitored metric is identical on
-        # every rank (EarlyStopping/ModelCheckpoint run on all ranks).
+        # Broadcast the rank-0 results so the monitored metric and the prototypes
+        # are identical on every rank (EarlyStopping/ModelCheckpoint and the
+        # M-step run on all ranks). Prototypes travel as CPU tensors.
         n_clusters = self.trainer.strategy.broadcast(n_clusters, src=0)
         silhouette = self.trainer.strategy.broadcast(silhouette, src=0)
+        prototypes = self.trainer.strategy.broadcast(prototypes, src=0)
+        concentrations = self.trainer.strategy.broadcast(concentrations, src=0)
+        self._prototypes = [p.to(self.device) for p in prototypes]
+        self._concentrations = [c.to(self.device) for c in concentrations]
+
         self.log("val_n_clusters", n_clusters, sync_dist=False, prog_bar=True)
         self.log("val_silhouette", silhouette, sync_dist=False)
+        self.log("val_n_prototypes", float(sum(p.shape[0] for p in self._prototypes)), sync_dist=False)
+
+    def _compute_prototypes(self, features, k_star):
+        """E-step: cluster the gathered embeddings into each granularity in
+        ``K`` and estimate per-centroid concentrations. Runs on rank 0 only;
+        returns ``(prototypes, concentrations)`` as lists of CPU tensors for
+        broadcasting. Centroids are L2-normalized so cosine logits are well
+        scaled."""
+        from torch_kmeans import KMeans
+
+        feats = features.detach().float().to(self.device)
+        # Sample independently of the silhouette metric: the prototype k-means is
+        # O(N*k*iters), not O(N^2), so it scales to many more samples cheaply.
+        n = self.hparams.proto_samples
+        if 0 < n < feats.shape[0]:
+            feats = feats[torch.randperm(feats.shape[0], device=feats.device)[:n]]
+        feats = F.normalize(feats, dim=1)
+
+        K = self._proto_K(k_star, feats.shape[0])
+        if not K:
+            return [], []
+
+        x = feats.unsqueeze(0)  # torch-kmeans expects (B, N, D)
+        prototypes, concentrations = [], []
+        for k in K:
+            res = KMeans(n_clusters=k, num_init=10, seed=0, verbose=False)(x)
+            labels = res.labels[0]
+            centroids = F.normalize(res.centers[0], dim=1)
+            phi = self._concentration(feats, labels, centroids)
+            prototypes.append(centroids.detach().cpu())
+            concentrations.append(phi.detach().cpu())
+        return prototypes, concentrations
+
+    def _proto_K(self, k_star, n_samples):
+        """Resolve the list of cluster counts ``K`` for ProtoNCE. Uses
+        ``--proto_clusters`` when given, otherwise derives ``{k*, 2k*, 4k*}``
+        from the silhouette-optimal ``k*``. Each ``k`` is kept only if
+        ``2 <= k < n_samples``."""
+        if self.hparams.proto_clusters:
+            ks = [int(tok) for tok in self.hparams.proto_clusters.split(",") if tok.strip()]
+        else:
+            k = int(k_star)
+            ks = [k, 2 * k, 4 * k] if k >= 2 else []
+        return sorted({k for k in ks if 2 <= k < n_samples})
+
+    def _concentration(self, feats, labels, centroids):
+        """Per-centroid concentration ``phi`` (eq. 12):
+        ``phi = sum_z ||v_z - c||^2 / (Z * log(Z + alpha))`` over the ``Z``
+        members of each cluster, then normalized so the set's mean is
+        ``proto_tau``. Empty/singleton clusters take the set mean."""
+        alpha = self.hparams.proto_alpha
+        tau = self.hparams.proto_tau
+        k = centroids.shape[0]
+        phi = centroids.new_full((k,), float("nan"))
+        for c in range(k):
+            mask = labels == c
+            Z = int(mask.sum())
+            if Z <= 1:
+                continue
+            d2 = torch.sum((feats[mask] - centroids[c]) ** 2)
+            phi[c] = d2 / (Z * math.log(Z + alpha))
+
+        valid = ~torch.isnan(phi)
+        if not valid.any():
+            return centroids.new_full((k,), tau)
+        phi = torch.where(torch.isnan(phi), phi[valid].mean(), phi)
+        return phi * (tau / phi.mean().clamp_min(1e-12))
 
     def _optimal_n_clusters(self, features):
         """Silhouette-optimal KMeans cluster count over a random subset of the

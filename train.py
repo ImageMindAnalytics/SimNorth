@@ -11,8 +11,8 @@ Logs to MLflow. Example:
         --nn SimNorth --data_module USDataModule \
         --csv_train train.parquet --csv_valid valid.parquet --csv_test test.parquet \
         --mount_point /data/frames \
-        --base_encoder efficientnet_b0 --emb_dim 128 --n_lights 64 \
-        --batch_size 256 --epochs 200 \
+        --base_encoder efficientnet_b0 --emb_dim 128 \
+        --batch_size 256 --epochs 200 --warmup_epochs 20 \
         --tracking_uri file:./mlruns --experiment_name SimNorth --run_name effnet_b0
 """
 
