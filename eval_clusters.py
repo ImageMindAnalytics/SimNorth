@@ -48,6 +48,7 @@ from simnorth import SimNorth
 from simnorth.data.dataset import _worker_init
 from simnorth.data.transforms import SimTestTransforms
 
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 def _read_table(path):
     if os.path.splitext(path)[1] == ".csv":
