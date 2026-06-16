@@ -63,6 +63,26 @@ Inspect runs:
 mlflow ui --backend-store-uri ./mlruns
 ```
 
+## Cluster evaluation
+
+`eval_clusters.py` embeds **every frame** of each blind-sweep cine in a table
+with a trained checkpoint, sweeps KMeans over a range of `k` with the silhouette
+score, and writes the silhouette plot, a montage of representative frames per
+cluster, and a per-frame `file_path,index,cluster_label` table (`index` is the
+frame index within the cine):
+
+```bash
+python eval_clusters.py \
+    --model checkpoints/last.ckpt \
+    --csv sweeps.parquet --mount_point /data --img_column file_path \
+    --img_size 256 --n_clusters_min 2 --n_clusters_max 40 \
+    --out eval_out
+```
+
+Outputs in `--out`: `silhouette.png`, `clusters_grid.png`, `clusters.csv`,
+`summary.json`. Pass `--n_clusters K` to force a specific `k` instead of the
+silhouette-best, and `--frame_stride N` to keep every Nth frame on long cines.
+
 ## Package layout
 
 ```
@@ -77,6 +97,7 @@ simnorth/
 └── docs/
     └── protonce_design.md  # ProtoNCE design doc
 train.py                  # training entrypoint (MLflow)
+eval_clusters.py          # cluster evaluation (silhouette, grids, labels)
 ```
 
 ## Provenance
