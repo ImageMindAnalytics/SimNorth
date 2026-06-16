@@ -89,9 +89,9 @@ class SimNorth(pl.LightningModule):
         weight_decay: AdamW weight decay.
         epochs: Used by the cosine annealing scheduler (``T_max``).
         w: Scale of the rank-based weighting on the contrastive (push) term.
-        proto_clusters: Comma-separated list of cluster counts ``K`` for the
-            ProtoNCE term (e.g. ``"8,16,32"``). Empty derives ``{k*, 2k*, 4k*}``
-            from the silhouette-optimal ``k*``.
+        proto_clusters: List of cluster counts ``K`` for the
+            ProtoNCE term (e.g. 8 16 32). Empty derives k* 2k* 4k*
+            from the silhouette-optimal k*.
         proto_samples: Embeddings sampled for the prototype k-means E-step
             (``<= 0`` uses all gathered embeddings). Decoupled from the O(N^2)
             silhouette metric's ``n_cluster_samples`` so prototypes can be
@@ -152,7 +152,7 @@ class SimNorth(pl.LightningModule):
 
         # ProtoNCE (prototypical contrastive) term. Clustering is gated by
         # ``warmup_epochs``; the term is inactive until then.
-        group.add_argument("--proto_clusters", default="", type=str, help="Comma-separated cluster counts K (e.g. '8,16,32'); empty derives {k*,2k*,4k*} from the silhouette-optimal k*")
+        group.add_argument("--proto_clusters", default=None, type=str, help="Cluster counts K (e.g. 8 16 32); empty derives k* 2k* 4k* from the silhouette-optimal k*")
         group.add_argument("--proto_samples", default=4096, type=int, help="Embeddings to sample for the prototype k-means E-step (<=0 uses all gathered embeddings). Decoupled from the O(N^2) silhouette metric's --n_cluster_samples.")
         group.add_argument("--proto_tau", default=0.1, type=float, help="Instance temperature / mean concentration the phi's are normalized to")
         group.add_argument("--proto_alpha", default=10.0, type=float, help="Concentration smoothing (eq. 12)")
@@ -164,7 +164,8 @@ class SimNorth(pl.LightningModule):
         group.add_argument("--warmup_epochs", default=10, type=int, help="Start clustering (silhouette metric + prototype E-step) after this many epochs")
         group.add_argument("--n_cluster_samples", default=4096, type=int, help="Embeddings to sample for the O(N^2) silhouette metric (<=0 disables clustering, including the prototype term)")
         group.add_argument("--n_clusters_min", default=2, type=int, help="Minimum k for the silhouette search")
-        group.add_argument("--n_clusters_max", default=20, type=int, help="Maximum k for the silhouette search")
+        group.add_argument("--n_clusters_max", default=20, type=int, help="Maximum k for the silhouette search (if val_k_saturated stays 1, raise this -- the search is hitting the ceiling)")
+        group.add_argument("--n_clusters_step", default=1, type=int, help="Stride for the silhouette k search; >1 keeps a wide [min,max] range affordable")
         return parent_parser
 
     @staticmethod
@@ -305,10 +306,18 @@ class SimNorth(pl.LightningModule):
         n_clusters, silhouette = 0.0, -1.0
         prototypes, concentrations = [], []
         if self.trainer.is_global_zero:
-            n_clusters, silhouette = self._optimal_n_clusters(features)
             # E-step: cluster the gathered embeddings into the ProtoNCE
-            # granularities and estimate each centroid's concentration.
-            prototypes, concentrations = self._compute_prototypes(features, n_clusters)
+            # granularities and estimate each centroid's concentration. The
+            # O(N^2)-per-k silhouette search only runs when its result (k*) is
+            # actually needed -- i.e. when --proto_clusters is empty so K must be
+            # derived from k*. With an explicit K, skip the search and take a
+            # cheap separation diagnostic from the base clustering instead.
+            if self.hparams.proto_clusters:
+                prototypes, concentrations, n_clusters, silhouette = \
+                    self._compute_prototypes(features, 0.0, diagnostic=True)
+            else:
+                n_clusters, silhouette = self._optimal_n_clusters(features)
+                prototypes, concentrations, _, _ = self._compute_prototypes(features, n_clusters)
 
         # Broadcast the rank-0 results so the monitored metric and the prototypes
         # are identical on every rank (EarlyStopping/ModelCheckpoint and the
@@ -323,13 +332,25 @@ class SimNorth(pl.LightningModule):
         self.log("val_n_clusters", n_clusters, sync_dist=False, prog_bar=True)
         self.log("val_silhouette", silhouette, sync_dist=False)
         self.log("val_n_prototypes", float(sum(p.shape[0] for p in self._prototypes)), sync_dist=False)
+        # Saturation flag (only meaningful while searching): k* pinned at the
+        # ceiling means the silhouette peak is beyond n_clusters_max, so the
+        # derived K is set by the ceiling rather than the data. Always 0 with an
+        # explicit --proto_clusters, since no search runs. proto_clusters is an
+        # hparam (identical on every rank), so this stays DDP-consistent.
+        saturated = (not self.hparams.proto_clusters) and (n_clusters >= self.hparams.n_clusters_max)
+        self.log("val_k_saturated", float(saturated), sync_dist=False)
 
-    def _compute_prototypes(self, features, k_star):
+    def _compute_prototypes(self, features, k_star, diagnostic=False):
         """E-step: cluster the gathered embeddings into each granularity in
         ``K`` and estimate per-centroid concentrations. Runs on rank 0 only;
-        returns ``(prototypes, concentrations)`` as lists of CPU tensors for
-        broadcasting. Centroids are L2-normalized so cosine logits are well
-        scaled."""
+        returns ``(prototypes, concentrations, diag_k, diag_silhouette)`` -- the
+        first two as lists of CPU tensors for broadcasting, centroids
+        L2-normalized so cosine logits are well scaled.
+
+        When ``diagnostic`` is set (explicit ``--proto_clusters``, no silhouette
+        search), ``diag_k``/``diag_silhouette`` report the base clustering's size
+        and a subsampled silhouette so the chosen ``K`` still gets a separation
+        signal; otherwise they are ``(0.0, -1.0)``."""
         from torch_kmeans import KMeans
 
         feats = features.detach().float().to(self.device)
@@ -342,18 +363,28 @@ class SimNorth(pl.LightningModule):
 
         K = self._proto_K(k_star, feats.shape[0])
         if not K:
-            return [], []
+            return [], [], 0.0, -1.0
 
         x = feats.unsqueeze(0)  # torch-kmeans expects (B, N, D)
         prototypes, concentrations = [], []
-        for k in K:
+        diag_k, diag_silhouette = 0.0, -1.0
+        for i, k in enumerate(K):
             res = KMeans(n_clusters=k, num_init=10, seed=0, verbose=False)(x)
             labels = res.labels[0]
             centroids = F.normalize(res.centers[0], dim=1)
             phi = self._concentration(feats, labels, centroids)
             prototypes.append(centroids.detach().cpu())
             concentrations.append(phi.detach().cpu())
-        return prototypes, concentrations
+            # Separation diagnostic at the coarsest (base) K, on a random
+            # subsample to keep the silhouette's O(N^2) cost bounded.
+            if diagnostic and i == 0:
+                m = self.hparams.n_cluster_samples
+                m = feats.shape[0] if m <= 0 else min(m, feats.shape[0])
+                idx = torch.randperm(feats.shape[0], device=feats.device)[:m]
+                s = self._silhouette_score(feats[idx], labels[idx])
+                diag_k = float(k)
+                diag_silhouette = -1.0 if torch.isnan(s) else float(s)
+        return prototypes, concentrations, diag_k, diag_silhouette
 
     def _proto_K(self, k_star, n_samples):
         """Resolve the list of cluster counts ``K`` for ProtoNCE. Uses
@@ -361,7 +392,7 @@ class SimNorth(pl.LightningModule):
         from the silhouette-optimal ``k*``. Each ``k`` is kept only if
         ``2 <= k < n_samples``."""
         if self.hparams.proto_clusters:
-            ks = [int(tok) for tok in self.hparams.proto_clusters.split(",") if tok.strip()]
+            ks = self.hparams.proto_clusters
         else:
             k = int(k_star)
             ks = [k, 2 * k, 4 * k] if k >= 2 else []
@@ -408,10 +439,11 @@ class SimNorth(pl.LightningModule):
             return 0.0, -1.0
 
         k_max = min(self.hparams.n_clusters_max, feats.shape[0] - 1)
+        step = max(1, self.hparams.n_clusters_step)
         # torch-kmeans expects a batch of datasets, shape (B, N, D).
         x = feats.unsqueeze(0)
         best_k, best_score = 0, -1.0
-        for k in range(self.hparams.n_clusters_min, k_max + 1):
+        for k in range(self.hparams.n_clusters_min, k_max + 1, step):
             # num_init/seed mirror sklearn's n_init/random_state; the default
             # LpDistance(p_norm=2) matches sklearn's euclidean metric.
             model = KMeans(n_clusters=k, num_init=10, seed=0, verbose=False)
