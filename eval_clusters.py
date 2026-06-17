@@ -38,8 +38,10 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import SimpleITK as sitk
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 import matplotlib
 matplotlib.use("Agg")
@@ -47,7 +49,7 @@ import matplotlib.pyplot as plt
 
 from torch_kmeans import KMeans
 
-from simnorth import SimNorth
+from simnorth import SimNorth, ProjectionHead
 from simnorth.data.dataset import _worker_init
 from simnorth.data.transforms import SimTestTransforms
 
@@ -111,8 +113,32 @@ class BlindSweepFrameDataset(Dataset):
         return {"frames": frames, "file_path": path, "orig_idx": orig_idx}
 
 
+def make_embedder(model, feature_layer):
+    """Return ``embed(chunk) -> (B, D) CPU L2-normalized features`` for the chosen
+    layer. ``"projection"`` uses the model's normal output (the 128-d ProtoNCE
+    embedding). ``"backbone"`` taps the **input** to the projection head -- the
+    pre-head representation -- which is usually more semantically useful for
+    downstream clustering (the head discards info to serve the contrastive loss).
+    Backbone features are L2-normalized here so all downstream cosine/centroid
+    assumptions still hold."""
+    if feature_layer == "projection":
+        return lambda chunk: model(chunk).float().cpu()
+
+    proj = next((m for m in model.modules() if isinstance(m, ProjectionHead)), None)
+    if proj is None:
+        raise SystemExit("No ProjectionHead found in the model; cannot tap backbone features.")
+    captured = {}
+    proj.register_forward_pre_hook(lambda _module, inp: captured.__setitem__("h", inp[0]))
+
+    def embed(chunk):
+        model(chunk)  # discard the post-head output; the hook grabs the head's input
+        return F.normalize(captured["h"], dim=1).float().cpu()
+
+    return embed
+
+
 @torch.no_grad()
-def extract_embeddings(model, df, args, device, transform):
+def extract_embeddings(model, df, args, device, transform, embed):
     """Embed cine frames. Returns ``(feats, records)`` where ``feats`` is
     ``(N, emb_dim)`` (CPU, L2-normalized) and ``records[i]`` is the
     ``(file_path, frame_index)`` of embedding ``i``. With ``args.n_samples > 0``
@@ -132,7 +158,11 @@ def extract_embeddings(model, df, args, device, transform):
 
     target = args.n_samples if args.n_samples > 0 else None
     embeddings, records = [], []
-    n_cines = 0
+    # When targeting N frames, show frame progress toward N; otherwise show cines.
+    if target is not None:
+        pbar = tqdm(total=target, unit="frame", desc="Embedding")
+    else:
+        pbar = tqdm(total=len(df), unit="cine", desc="Embedding")
     for batch in loader:
         for item in batch:
             frames = item["frames"]  # (T', 3, H, W)
@@ -140,14 +170,13 @@ def extract_embeddings(model, df, args, device, transform):
             zs = []
             for s in range(0, frames.shape[0], args.batch_size):
                 chunk = frames[s:s + args.batch_size].to(device, non_blocking=True)
-                zs.append(model(chunk).float().cpu())  # forward L2-normalizes
+                zs.append(embed(chunk))  # (B, D) CPU, L2-normalized
             embeddings.append(torch.cat(zs, dim=0))
             records.extend((item["file_path"], int(fi)) for fi in item["orig_idx"])
-            n_cines += 1
-        if n_cines and n_cines % 50 == 0:
-            print(f"  embedded {n_cines} cines, {len(records)} frames", flush=True)
+            pbar.update(frames.shape[0] if target is not None else 1)
         if target is not None and len(records) >= target:
             break
+    pbar.close()
     if not embeddings:
         raise SystemExit("No frames were embedded (all cines failed to read?).")
     feats = torch.cat(embeddings, dim=0)
@@ -178,7 +207,8 @@ def silhouette_sweep(feats, args, device):
     k_max = min(args.n_clusters_max, sub.shape[0] - 1)
     step = max(1, args.n_clusters_step)
     ks, scores = [], []
-    for k in range(args.n_clusters_min, k_max + 1, step):
+    pbar = tqdm(range(args.n_clusters_min, k_max + 1, step), unit="k", desc="Silhouette sweep")
+    for k in pbar:
         labels, _ = _kmeans(sub, k, args.num_init, device)
         if torch.unique(labels).numel() < 2:
             continue
@@ -187,7 +217,7 @@ def silhouette_sweep(feats, args, device):
             continue
         ks.append(k)
         scores.append(float(s))
-        print(f"  k={k:3d}  silhouette={float(s):.4f}", flush=True)
+        pbar.set_postfix(k=k, silhouette=f"{float(s):.4f}")
     return ks, scores
 
 
@@ -232,9 +262,9 @@ def render_representatives(needed_idx, records, args, transform):
         by_path[path].append((gi, frame_idx))
 
     images = {}
-    for path, items in by_path.items():
+    for path, items in tqdm(by_path.items(), unit="cine", desc="Rendering reps"):
         frames, orig_idx = _read_cine(path, args, transform)
-        if frames is None:
+        if frames is None or orig_idx is None:
             continue
         pos = {oi: i for i, oi in enumerate(orig_idx)}
         for gi, frame_idx in items:
@@ -287,8 +317,9 @@ def main(args):
         print(f"Sampling mode: shuffled sweeps, {args.frames_per_sweep} frames/sweep "
               f"until {args.n_samples} total frames")
 
-    print("Extracting per-frame embeddings...")
-    feats, records = extract_embeddings(model, df, args, device, transform)
+    embed = make_embedder(model, args.feature_layer)
+    print(f"Extracting per-frame embeddings ({args.feature_layer} features)...")
+    feats, records = extract_embeddings(model, df, args, device, transform, embed)
     print(f"Embeddings: {tuple(feats.shape)} over {len(set(p for p, _ in records))} cines")
 
     print("Silhouette sweep...")
@@ -323,6 +354,7 @@ def main(args):
     summary = {
         "model": args.model,
         "csv": args.csv,
+        "feature_layer": args.feature_layer,
         "n_cines": len(set(p for p, _ in records)),
         "n_frames": int(feats.shape[0]),
         "chosen_k": int(chosen_k),
@@ -349,7 +381,7 @@ if __name__ == "__main__":
     data_group.add_argument("--img_size", default=256, type=int, help="Square center-crop size (match training)")
     data_group.add_argument("--frame_stride", default=1, type=int, help="Keep every Nth frame per cine (1 = all frames)")
     data_group.add_argument("--n_samples", default=0, type=int, help="Total frames to sample for clustering (0 = use every frame of every cine)")
-    data_group.add_argument("--frames_per_sweep", default=16, type=int, help="Random frames to take per cine when --n_samples > 0")
+    data_group.add_argument("--frames_per_sweep", default=8, type=int, help="Random frames to take per cine when --n_samples > 0")
     data_group.add_argument("--seed", default=0, type=int, help="Seed for sweep shuffling and per-cine frame sampling")
     data_group.add_argument("--batch_size", default=256, type=int, help="Frames per forward pass")
     data_group.add_argument("--cines_per_batch", default=1, type=int, help="Cines read per dataloader batch")
@@ -365,6 +397,8 @@ if __name__ == "__main__":
     cl_group.add_argument("--n_cluster_samples", default=4096, type=int, help="Subsample size for the O(N^2) silhouette (<=0 uses all)")
     cl_group.add_argument("--num_init", default=10, type=int, help="KMeans restarts (num_init)")
     cl_group.add_argument("--grid_n", default=8, type=int, help="Representative frames per cluster in the montage")
+    cl_group.add_argument("--feature_layer", default="backbone", choices=["backbone", "projection"],
+                          help="Which features to cluster: 'backbone' (pre-projection-head representation, usually more semantic) or 'projection' (the 128-d ProtoNCE embedding)")
 
     parser.add_argument("--device", default=None, type=str, help="torch device (default: cuda if available)")
 
