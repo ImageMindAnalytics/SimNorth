@@ -25,7 +25,7 @@ class SimNorthImageLogger(Callback):
         if not isinstance(logger, MLFlowLogger):
             return
 
-        img1, _ = batch
+        img1 = batch[0]
         max_num_image = min(img1.shape[0], self.num_images)
         grid = torchvision.utils.make_grid(img1[:max_num_image])
 

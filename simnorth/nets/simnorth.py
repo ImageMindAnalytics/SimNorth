@@ -1,10 +1,14 @@
 """SimNorth contrastive self-supervised model.
 
 SimNorth learns ultrasound frame embeddings on the unit hypersphere. Two
-augmented views of the same frame are pulled together (alignment), randomly
-paired views are pushed apart with a rank-weighted penalty (uniformity), and a
-prototypical-contrastive term (ProtoNCE) pulls each embedding toward the
-data-driven cluster centroid it belongs to.
+augmented views of a positive pair are pulled together (alignment) -- either two
+augmentations of the same frame, or, with the data module's ``temporal_window``,
+two nearby frames of the same blind sweep so alignment captures anatomical (not
+just augmentation) invariance. Randomly paired views are pushed apart with a
+rank-weighted penalty (uniformity); when the loader supplies ``sweep_ids``,
+same-sweep pairs are dropped from that push as false negatives. A prototypical-
+contrastive term (ProtoNCE) pulls each embedding toward the data-driven cluster
+centroid it belongs to.
 
 The prototypes follow the Expectation-Maximization scheme of Prototypical
 Contrastive Learning (Li et al., ICLR 2021, ``simnorth/docs/2005.04966v5.pdf``):
@@ -199,7 +203,7 @@ class SimNorth(pl.LightningModule):
         )
         return [optimizer], [lr_scheduler]
 
-    def compute_loss(self, x_0, x_1, mode):
+    def compute_loss(self, x_0, x_1, mode, sweep_ids=None):
         batch_size = x_0.size(0)
 
         # Only sync logged metrics across ranks for the epoch-level validation
@@ -210,7 +214,8 @@ class SimNorth(pl.LightningModule):
         z = self(self.noise_transform(x))
         z_0, z_1 = torch.split(z, batch_size)
 
-        # --- Alignment: the two views of the same frame should match ---
+        # --- Alignment: the two views of a positive pair (same frame, or nearby
+        #     frames of one sweep with temporal_window > 0) should match ---
         loss_proj = self.loss(z_0, z_1)
         loss_proj_mean = torch.mean(loss_proj)
         loss_proj_std = torch.std(loss_proj)
@@ -221,15 +226,24 @@ class SimNorth(pl.LightningModule):
         #     related, so we don't want to force them apart) are penalized least,
         #     while the most-different pairs are penalized most.
         r = torch.randperm(batch_size)
-        z_0_r = z_0[r]
-        loss_proj_c = self.loss(z_0_r, z_1)
-        loss_proj_c_mean = torch.mean(loss_proj_c)
-        loss_proj_c_std = torch.std(loss_proj_c)
+        loss_proj_c = self.loss(z_0[r], z_1)  # (B,) cosine of random pairs
 
-        loss_proj_c_sorted_i = torch.argsort(loss_proj_c)  # ascending: most different first
-        loss_proj_c = loss_proj_c[loss_proj_c_sorted_i]
-        w = torch.square(torch.arange(batch_size, device=self.device) / batch_size - 1.0) * self.hparams.w
-        loss_proj_c = torch.sum(w * torch.square(loss_proj_c))
+        # Drop same-sweep pairs: neighboring frames of one blind sweep are
+        # near-duplicates, so penalizing them as negatives fights the very
+        # cluster structure we want (explicit false-negative removal). Without
+        # sweep_ids (non-blind loaders) every pair is kept, as before.
+        if sweep_ids is not None:
+            loss_proj_c = loss_proj_c[sweep_ids[r] != sweep_ids]
+
+        m = loss_proj_c.numel()
+        if m > 0:
+            loss_proj_c_mean = torch.mean(loss_proj_c)
+            loss_proj_c_std = torch.std(loss_proj_c) if m > 1 else loss_proj_c.new_zeros(())
+            loss_proj_c_sorted = loss_proj_c[torch.argsort(loss_proj_c)]  # ascending: most different first
+            w = torch.square(torch.arange(m, device=self.device) / m - 1.0) * self.hparams.w
+            loss_proj_c = torch.sum(w * torch.square(loss_proj_c_sorted))
+        else:  # whole batch was one sweep -> no valid negatives this step
+            loss_proj_c = loss_proj_c_mean = loss_proj_c_std = z.new_zeros(())
 
         loss = loss_proj + loss_proj_c
 
@@ -269,14 +283,23 @@ class SimNorth(pl.LightningModule):
             total = total + F.cross_entropy(logits, assign)
         return total / len(self._prototypes)
 
-    def training_step(self, batch, batch_idx):
+    @staticmethod
+    def _split_batch(batch):
+        """Unpack a batch into ``(x_0, x_1, sweep_ids)``. The blind-sweep collate
+        appends per-frame sweep ids for the false-negative mask; other loaders
+        yield just ``(x_0, x_1)`` and get ``sweep_ids=None`` (no masking)."""
+        if len(batch) == 3:
+            return batch
         x_0, x_1 = batch
-        return self.compute_loss(x_0, x_1, mode="train")
+        return x_0, x_1, None
+
+    def training_step(self, batch, batch_idx):
+        x_0, x_1, sweep_ids = self._split_batch(batch)
+        return self.compute_loss(x_0, x_1, mode="train", sweep_ids=sweep_ids)
 
     def validation_step(self, batch, batch_idx):
-        
-        x_0, x_1 = batch
-        self.compute_loss(x_0, x_1, mode="val")
+        x_0, x_1, sweep_ids = self._split_batch(batch)
+        self.compute_loss(x_0, x_1, mode="val", sweep_ids=sweep_ids)
 
         # Track clean (un-jittered) embeddings for the cluster-count metric.
         # CatMetric accumulates per rank and concatenates across ranks on compute.
