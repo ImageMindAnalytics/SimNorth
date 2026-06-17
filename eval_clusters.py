@@ -1,8 +1,10 @@
 """Cluster-evaluate a trained SimNorth model over blind-sweep cines.
 
-Loads a checkpoint, embeds **every frame** of each blind-sweep cine listed in a
-CSV/parquet, sweeps KMeans over a range of ``k`` with the silhouette score, then
-at the chosen ``k`` writes:
+Loads a checkpoint, embeds the blind-sweep cines listed in a CSV/parquet, sweeps
+KMeans over a range of ``k`` with the silhouette score, then at the chosen ``k``
+writes the outputs below. By default **every frame** of every cine is embedded;
+pass ``--n_samples N`` to instead shuffle the sweeps and take ``--frames_per_sweep``
+random frames from each until ``N`` total frames are collected.
 
   * ``silhouette.png``   - silhouette vs. k, with the chosen k marked
   * ``clusters_grid.png``- montage: one row per cluster, the frames nearest its
@@ -30,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+import zlib
 from collections import defaultdict
 
 import numpy as np
@@ -56,10 +59,12 @@ def _read_table(path):
     return pd.read_parquet(path)
 
 
-def _read_cine(path, args, transform):
-    """Read every frame of a blind-sweep cine. Returns ``(frames, orig_idx)``
+def _read_cine(path, args, transform, n_frames=None):
+    """Read frames of a blind-sweep cine. Returns ``(frames, orig_idx)``
     where ``frames`` is ``(T', 3, H, W)`` after the eval transform and
     ``orig_idx`` are the original frame indices kept (honoring ``frame_stride``).
+    If ``n_frames`` is set and the cine has more frames than that, a random
+    subset of ``n_frames`` (seeded per-path for reproducibility) is kept.
     Returns ``(None, None)`` on a read error."""
     full = os.path.join(args.mount_point, path)
     try:
@@ -68,6 +73,12 @@ def _read_cine(path, args, transform):
         if img.GetNumberOfComponentsPerPixel() > 1:  # grab the first component
             arr = arr[:, :, :, 0]
         orig_idx = list(range(0, arr.shape[0], max(1, args.frame_stride)))
+        if n_frames is not None and 0 < n_frames < len(orig_idx):
+            # Deterministic per-path subset so the same frames are sampled each run.
+            seed = (args.seed + zlib.crc32(path.encode())) & 0x7FFFFFFF
+            g = torch.Generator().manual_seed(seed)
+            sel = torch.randperm(len(orig_idx), generator=g)[:n_frames].sort().values
+            orig_idx = [orig_idx[i] for i in sel.tolist()]
         arr = arr[orig_idx]
         arr = arr.unsqueeze(1)  # (T', 1, H, W)
         if bool(args.repeat_channel):
@@ -93,7 +104,8 @@ class BlindSweepFrameDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.df.iloc[idx][self.args.img_column]
-        frames, orig_idx = _read_cine(path, self.args, self.transform)
+        n_frames = self.args.frames_per_sweep if self.args.frames_per_sweep > 0 else None
+        frames, orig_idx = _read_cine(path, self.args, self.transform, n_frames=n_frames)
         if frames is None:
             return None
         return {"frames": frames, "file_path": path, "orig_idx": orig_idx}
@@ -101,9 +113,10 @@ class BlindSweepFrameDataset(Dataset):
 
 @torch.no_grad()
 def extract_embeddings(model, df, args, device, transform):
-    """Embed every frame of every cine. Returns ``(feats, records)`` where
-    ``feats`` is ``(N, emb_dim)`` (CPU, L2-normalized) and ``records[i]`` is the
-    ``(file_path, frame_index)`` of embedding ``i``."""
+    """Embed cine frames. Returns ``(feats, records)`` where ``feats`` is
+    ``(N, emb_dim)`` (CPU, L2-normalized) and ``records[i]`` is the
+    ``(file_path, frame_index)`` of embedding ``i``. With ``args.n_samples > 0``
+    stops once that many frames are collected (cines pre-shuffled in ``main``)."""
     ds = BlindSweepFrameDataset(df, args, transform)
     loader = DataLoader(
         ds,
@@ -117,6 +130,7 @@ def extract_embeddings(model, df, args, device, transform):
         worker_init_fn=_worker_init,
     )
 
+    target = args.n_samples if args.n_samples > 0 else None
     embeddings, records = [], []
     n_cines = 0
     for batch in loader:
@@ -132,9 +146,15 @@ def extract_embeddings(model, df, args, device, transform):
             n_cines += 1
         if n_cines and n_cines % 50 == 0:
             print(f"  embedded {n_cines} cines, {len(records)} frames", flush=True)
+        if target is not None and len(records) >= target:
+            break
     if not embeddings:
         raise SystemExit("No frames were embedded (all cines failed to read?).")
-    return torch.cat(embeddings, dim=0), records
+    feats = torch.cat(embeddings, dim=0)
+    if target is not None and feats.shape[0] > target:  # trim the tail to exactly N
+        feats = feats[:target]
+        records = records[:target]
+    return feats, records
 
 
 def _kmeans(feats, k, num_init, device):
@@ -261,6 +281,12 @@ def main(args):
     df = _read_table(args.csv).reset_index(drop=True)
     print(f"Loaded {len(df)} cines from {args.csv}")
 
+    if args.n_samples > 0:
+        # Randomize sweep order so the first-N frames are an unbiased sample.
+        df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+        print(f"Sampling mode: shuffled sweeps, {args.frames_per_sweep} frames/sweep "
+              f"until {args.n_samples} total frames")
+
     print("Extracting per-frame embeddings...")
     feats, records = extract_embeddings(model, df, args, device, transform)
     print(f"Embeddings: {tuple(feats.shape)} over {len(set(p for p, _ in records))} cines")
@@ -322,6 +348,9 @@ if __name__ == "__main__":
     data_group = parser.add_argument_group("Data")
     data_group.add_argument("--img_size", default=256, type=int, help="Square center-crop size (match training)")
     data_group.add_argument("--frame_stride", default=1, type=int, help="Keep every Nth frame per cine (1 = all frames)")
+    data_group.add_argument("--n_samples", default=0, type=int, help="Total frames to sample for clustering (0 = use every frame of every cine)")
+    data_group.add_argument("--frames_per_sweep", default=16, type=int, help="Random frames to take per cine when --n_samples > 0")
+    data_group.add_argument("--seed", default=0, type=int, help="Seed for sweep shuffling and per-cine frame sampling")
     data_group.add_argument("--batch_size", default=256, type=int, help="Frames per forward pass")
     data_group.add_argument("--cines_per_batch", default=1, type=int, help="Cines read per dataloader batch")
     data_group.add_argument("--num_workers", default=4, type=int, help="Dataloader workers (cine readers)")
