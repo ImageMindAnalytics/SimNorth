@@ -111,7 +111,7 @@ def main(args):
 
     if args.mlflow_experiment:
         logger_mlflow = MLFlowLogger(
-            tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+            tracking_uri=os.getenv("MLFLOW_TRACKING_URI", args.tracking_uri),
             experiment_name=args.mlflow_experiment,
             tags=_parse_kv_tags(args.mlflow_tags),
         )

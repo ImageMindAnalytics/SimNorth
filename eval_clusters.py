@@ -299,14 +299,36 @@ def plot_cluster_grid(reps, images, out_path, n_per_cluster):
     plt.close(fig)
 
 
+def _clahe_from_model(model):
+    """Read the CLAHE preprocessing config the model was *trained* with, from its
+    saved hyperparameters (``train.py`` passes the data args into the model, so
+    ``train_transform`` etc. live in ``model.hparams``). CLAHE is on iff the model
+    used ``--train_transform 3``; clip/grid fall back to the transform defaults
+    when not explicitly recorded. Returns ``(enabled, kwargs)`` for ``SimTestTransforms``."""
+    hp = model.hparams
+    enabled = int(getattr(hp, "train_transform", 0)) == 3
+    kwargs = {}
+    if hasattr(hp, "clahe_clip"):
+        kwargs["clahe_clip"] = hp.clahe_clip
+    if hasattr(hp, "clahe_grid"):
+        kwargs["clahe_grid"] = hp.clahe_grid
+    return enabled, kwargs
+
+
 def main(args):
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    transform = SimTestTransforms(args.img_size)
 
     print(f"Loading model from {args.model}")
     model = SimNorth.load_from_checkpoint(args.model, map_location=device)
     model.eval().to(device)
+
+    # Match the model's training preprocessing: read CLAHE off the checkpoint
+    # rather than asking the user to re-specify it (train/eval must agree).
+    clahe, clahe_kwargs = _clahe_from_model(model)
+    transform = SimTestTransforms(args.img_size, clahe=clahe, **clahe_kwargs)
+    print(f"CLAHE preprocessing: {'on' if clahe else 'off'} "
+          f"(from model hparams.train_transform)")
 
     df = _read_table(args.csv).reset_index(drop=True)
     print(f"Loaded {len(df)} cines from {args.csv}")
@@ -355,6 +377,7 @@ def main(args):
         "model": args.model,
         "csv": args.csv,
         "feature_layer": args.feature_layer,
+        "clahe": bool(clahe),
         "n_cines": len(set(p for p, _ in records)),
         "n_frames": int(feats.shape[0]),
         "chosen_k": int(chosen_k),

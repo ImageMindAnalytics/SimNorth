@@ -16,17 +16,23 @@ import SimpleITK as sitk
 from torch.utils.data import Dataset, DataLoader
 from lightning.pytorch import LightningDataModule
 
-from .transforms import SimTrainTransforms, SimTrainTransformsV2, SimEvalTransforms
+from .transforms import SimTrainTransforms, SimTrainTransformsV2, SimTrainTransformsV3, SimEvalTransforms
 
 
 def _worker_init(_):
-    """Pin ITK to a single thread inside each DataLoader worker.
+    """Pin ITK (and cv2) to a single thread inside each DataLoader worker.
 
     Forked workers can inherit a locked ITK/OpenMP thread-pool mutex and deadlock
     on the first ``ReadImage``; disabling ITK's thread pool avoids this (and the
-    thread oversubscription from one pool per worker).
+    thread oversubscription from one pool per worker). cv2 (CLAHE) is pinned for
+    the same oversubscription reason once many workers run it in parallel.
     """
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
 
 
 class USDataset(Dataset):
@@ -186,11 +192,15 @@ class USDataModule(LightningDataModule):
             if self.df_test is not None:
                 self.df_test = self.df_test.query(query).reset_index(drop=True)
 
-        if self.hparams.train_transform == 2:
+        if self.hparams.train_transform == 3:
+            self.train_transform = SimTrainTransformsV3(self.hparams.img_size)
+        elif self.hparams.train_transform == 2:
             self.train_transform = SimTrainTransformsV2(self.hparams.img_size)
         else:
             self.train_transform = SimTrainTransforms(self.hparams.img_size)
-        self.valid_transform = SimEvalTransforms(self.hparams.img_size)
+        # V3 prepends deterministic CLAHE; eval must match or train/eval statistics diverge.
+        clahe = self.hparams.train_transform == 3
+        self.valid_transform = SimEvalTransforms(self.hparams.img_size, clahe=clahe)
         self.test_transform = self.valid_transform
 
     @staticmethod
@@ -211,7 +221,7 @@ class USDataModule(LightningDataModule):
         group.add_argument("--query", default=None, type=str, help="Optional pandas query filter")
         group.add_argument("--batch_size", default=256, type=int, help="Batch size")
         group.add_argument("--num_workers", default=4, type=int, help="Dataloader workers")
-        group.add_argument("--train_transform", default=2, type=int, help="0=default, 2=V2 transforms")
+        group.add_argument("--train_transform", default=3, type=int, help="0=default, 2=V2 transforms, 3=V3 (CLAHE + blur, also applies CLAHE at eval)")
         group.add_argument("--drop_last", default=1, type=int, help="Drop last incomplete batch")
         group.add_argument("--repeat_channel", default=1, type=int, help="Repeat grayscale frames to 3 channels")
         group.add_argument("--prefetch_factor", default=2, type=int, help="Dataloader prefetch factor")
@@ -277,7 +287,7 @@ class USDataModuleBlindSweep(USDataModule):
         group.add_argument("--num_frames", default=32, type=int, help="Frames sampled per blind sweep")
         group.add_argument("--temporal_window", default=0, type=int, help="Pair each anchor frame with a partner within +/-W raw frames of the same sweep (0 = same-frame positives)")
         group.add_argument("--num_workers", default=4, type=int, help="Dataloader workers")
-        group.add_argument("--train_transform", default=2, type=int, help="0=default, 2=V2 transforms")
+        group.add_argument("--train_transform", default=2, type=int, help="0=default, 2=V2 transforms, 3=V3 (CLAHE + blur, also applies CLAHE at eval)")
         group.add_argument("--drop_last", default=1, type=int, help="Drop last incomplete batch")
         group.add_argument("--repeat_channel", default=1, type=int, help="Repeat grayscale frames to 3 channels")
         group.add_argument("--prefetch_factor", default=2, type=int, help="Dataloader prefetch factor")        

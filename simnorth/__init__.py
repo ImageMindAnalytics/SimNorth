@@ -1,8 +1,10 @@
 from .nets.simnorth import SimNorth, ProjectionHead, GaussianNoise
 from .data.dataset import USDataset, USDataModule, USDatasetBlindSweep, USDataModuleBlindSweep
 from .data.transforms import (
+    CLAHE,
     SimTrainTransforms,
     SimTrainTransformsV2,
+    SimTrainTransformsV3,
     SimEvalTransforms,
     SimTestTransforms,
 )
@@ -17,8 +19,10 @@ __all__ = [
     "USDataModule",
     "USDatasetBlindSweep",
     "USDataModuleBlindSweep",
+    "CLAHE",
     "SimTrainTransforms",
     "SimTrainTransformsV2",
+    "SimTrainTransformsV3",
     "SimEvalTransforms",
     "SimTestTransforms",
     "SimNorthImageLogger",
