@@ -323,12 +323,14 @@ def main(args):
     model = SimNorth.load_from_checkpoint(args.model, map_location=device)
     model.eval().to(device)
 
-    # Match the model's training preprocessing: read CLAHE off the checkpoint
-    # rather than asking the user to re-specify it (train/eval must agree).
+    # Match the model's training preprocessing: read CLAHE and crop size off the
+    # checkpoint rather than asking the user to re-specify them (train/eval must
+    # agree). An explicit --img_size still overrides.
     clahe, clahe_kwargs = _clahe_from_model(model)
-    transform = SimTestTransforms(args.img_size, clahe=clahe, **clahe_kwargs)
-    print(f"CLAHE preprocessing: {'on' if clahe else 'off'} "
-          f"(from model hparams.train_transform)")
+    img_size = args.img_size if args.img_size else int(getattr(model.hparams, "img_size", 256))
+    transform = SimTestTransforms(img_size, clahe=clahe, **clahe_kwargs)
+    print(f"img_size={img_size} (from {'--img_size' if args.img_size else 'model hparams'}); "
+          f"CLAHE preprocessing: {'on' if clahe else 'off'} (from model hparams.train_transform)")
 
     df = _read_table(args.csv).reset_index(drop=True)
     print(f"Loaded {len(df)} cines from {args.csv}")
@@ -377,6 +379,7 @@ def main(args):
         "model": args.model,
         "csv": args.csv,
         "feature_layer": args.feature_layer,
+        "img_size": int(img_size),
         "clahe": bool(clahe),
         "n_cines": len(set(p for p, _ in records)),
         "n_frames": int(feats.shape[0]),
@@ -401,7 +404,7 @@ if __name__ == "__main__":
     io_group.add_argument("--out", default="./eval_out", type=str, help="Output directory")
 
     data_group = parser.add_argument_group("Data")
-    data_group.add_argument("--img_size", default=256, type=int, help="Square center-crop size (match training)")
+    data_group.add_argument("--img_size", default=None, type=int, help="Square center-crop size (default: read from model hparams; pass to override)")
     data_group.add_argument("--frame_stride", default=1, type=int, help="Keep every Nth frame per cine (1 = all frames)")
     data_group.add_argument("--n_samples", default=0, type=int, help="Total frames to sample for clustering (0 = use every frame of every cine)")
     data_group.add_argument("--frames_per_sweep", default=8, type=int, help="Random frames to take per cine when --n_samples > 0")

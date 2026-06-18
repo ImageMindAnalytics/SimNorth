@@ -107,7 +107,12 @@ class SimTrainTransformsV3:
                 ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
                 v2.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-0.2, 0.2]),
                 v2.RandomHorizontalFlip(),
-                v2.Compose([v2.RandomRotation(180), v2.Pad(32), v2.RandomCrop(height)]),
+                v2.RandomRotation(30),
+                # No pad: frames are larger than the crop, so RandomCrop draws a
+                # window of real content (translation jitter) with no synthetic
+                # black border -- eval's CenterCrop(height) is the center of this
+                # same distribution. pad_if_needed guards rare smaller frames.
+                v2.RandomCrop(height, pad_if_needed=True),
                 v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
             ]
         )
